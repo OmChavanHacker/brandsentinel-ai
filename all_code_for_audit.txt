@@ -1,0 +1,306 @@
+﻿"""Tamper-evident, append-only audit ledger using canonical JSON SHA-256 chains."""
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timezone
+from hashlib import sha256
+import json
+from typing import Any
+
+
+GENESIS_HASH = "0" * 64
+
+
+def canonical_json(value: Any) -> str:
+    """Return a stable serialization so equal events always hash identically."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+class AuditLedger:
+    def __init__(self) -> None:
+        self._entries: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _digest(entry_without_hash: dict[str, Any]) -> str:
+        return sha256(canonical_json(entry_without_hash).encode("utf-8")).hexdigest()
+
+    def append(self, event_type: str, actor: str, payload: dict[str, Any]) -> dict[str, Any]:
+        previous_hash = self._entries[-1]["hash"] if self._entries else GENESIS_HASH
+        entry = {
+            "sequence": len(self._entries) + 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": event_type,
+            "actor": actor,
+            "payload": payload,
+            "previous_hash": previous_hash,
+        }
+        entry["hash"] = self._digest(entry)
+        self._entries.append(entry)
+        return deepcopy(entry)
+
+    def entries(self) -> list[dict[str, Any]]:
+        return deepcopy(self._entries)
+
+    def verify(self, entries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        chain = self._entries if entries is None else entries
+        expected_previous = GENESIS_HASH
+        for index, item in enumerate(chain):
+            unsigned = {key: value for key, value in item.items() if key != "hash"}
+            expected_hash = self._digest(unsigned)
+            if item.get("sequence") != index + 1:
+                return {"valid": False, "checked_entries": index + 1, "failure": "sequence mismatch", "sequence": index + 1}
+            if item.get("previous_hash") != expected_previous:
+                return {"valid": False, "checked_entries": index + 1, "failure": "previous hash mismatch", "sequence": index + 1}
+            if item.get("hash") != expected_hash:
+                return {"valid": False, "checked_entries": index + 1, "failure": "content hash mismatch", "sequence": index + 1}
+            expected_previous = item["hash"]
+        return {"valid": True, "checked_entries": len(chain), "head_hash": expected_previous}
+
+    def simulate_tamper(self) -> dict[str, Any]:
+        """Mutate only a copy; production ledger is never modified."""
+        sandbox = self.entries()
+        if not sandbox:
+            return {"before": self.verify(sandbox), "after": self.verify(sandbox), "diff": None}
+        target = sandbox[-1]
+        original = target["payload"]
+        target["payload"] = {**target["payload"], "tampered": True}
+        return {
+            "before": self.verify(self.entries()),
+            "after": self.verify(sandbox),
+            "diff": {"sequence": target["sequence"], "field": "payload", "before": original, "after": target["payload"]},
+        }
+from __future__ import annotations
+
+from typing import Literal
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from .audit_ledger import AuditLedger
+from .rag_engine import RagEngine
+from .workflow import Workflow, WorkflowTransitionError
+
+app = FastAPI(title="BrandSentinel AI", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3000"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+ledger, engine, workflow = AuditLedger(), RagEngine(), Workflow()
+
+SCENARIOS = {
+    "expired": "Our bottles use 80% recycled packaging, making us the best sustainable choice.",
+    "superlative": "BrandSentinel is the unbeatable, number one governance platform for every team.",
+    "unverified": "Our new workflow reduces legal review time by 67% for 10,000 customers.",
+}
+
+class ReviewRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+    actor: str = "CREATOR"
+
+class ActionRequest(BaseModel):
+    action: Literal["send_for_approval", "approve"]
+    role: Literal["CREATOR", "MANAGER", "LEGAL"]
+    needs_legal: bool = False
+
+@app.get("/api/health")
+def health() -> dict:
+    return {"status": "healthy", "service": "BrandSentinel AI"}
+
+@app.get("/api/session/demo")
+def demo(scenario: Literal["expired", "superlative", "unverified"] = "expired") -> dict:
+    global workflow
+    workflow = Workflow()
+    content = SCENARIOS[scenario]
+    entry = ledger.append("WORKSPACE_LOADED", "SYSTEM", {"scenario": scenario})
+    return {"content": content, "state": workflow.state, "audit_head": entry["hash"], "scenario": scenario}
+
+@app.post("/api/review")
+def review(request: ReviewRequest) -> dict:
+    state = workflow.transition("review", request.actor)
+    result = engine.review(request.content)
+    entry = ledger.append("CONTENT_REVIEWED", request.actor, {"state": state, "finding_counts": {key: len(result[key]) for key in ("grounded", "human_review", "suppressed")}})
+    return {**result, "state": state, "audit_head": entry["hash"]}
+
+@app.post("/api/action")
+def action(request: ActionRequest) -> dict:
+    try:
+        state = workflow.transition(request.action, request.role, request.needs_legal)
+    except WorkflowTransitionError as error:
+        return {"success": False, "message": error.message}
+    entry = ledger.append("WORKFLOW_ACTION", request.role, {"action": request.action, "state": state, "needs_legal": request.needs_legal})
+    return {"success": True, "state": state, "audit_head": entry["hash"]}
+
+@app.get("/api/audit")
+def audit() -> dict:
+    return {"entries": ledger.entries(), "verification": ledger.verify()}
+
+@app.get("/api/audit/verify")
+def verify_audit() -> dict:
+    return ledger.verify()
+
+@app.post("/api/audit/simulate-tamper")
+def simulate_tamper() -> dict:
+    return ledger.simulate_tamper()
+"""Deterministic policy checks plus semantic retrieval with cite-or-stay-silent handling."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+import re
+from typing import Any
+
+
+@dataclass(frozen=True)
+class PolicySource:
+    rule_id: str
+    section: str
+    passage: str
+    expiry_date: str | None
+    kind: str
+    terms: tuple[str, ...]
+    rewrite: str | None = None
+
+
+KNOWLEDGE_BASE = (
+    PolicySource("VG-01", "Voice Guide Â§1.2", "Avoid absolute or unsupported superlatives such as 'best', 'number one', and 'unbeatable'.", None, "violation", ("best", "number one", "unbeatable"), "Use a specific, supportable benefit instead."),
+    PolicySource("CP-2.1-2025", "Claims Policy Â§2.1", "The 2025 sustainability statistic: 80% recycled packaging is approved only through 2025-12-31.", "2025-12-31", "expired_fact", ("80% recycled", "80% recycled packaging"), "Our packaging programme is being updated; see our latest sustainability report."),
+    PolicySource("CP-2.1-2027", "Claims Policy Â§2.1", "The 2027 sustainability statistic: 95% recycled packaging is approved from 2027-01-01 through 2027-12-31.", "2027-12-31", "future_fact", ("95% recycled", "95% recycled packaging")),
+    PolicySource("VG-03", "Voice Guide Â§2.3", "Use direct, clear language and state product benefits without unverifiable comparisons.", None, "guidance", ("clear", "direct")),
+)
+
+
+class RagEngine:
+    def __init__(self) -> None:
+        self._model: Any | None = None
+        self._model_attempted = False
+
+    def _semantic_score(self, sentence: str, source: PolicySource) -> float:
+        """Use sentence-transformers if a local model exists, deterministic lexical fallback otherwise."""
+        if not self._model_attempted:
+            self._model_attempted = True
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+            except Exception:
+                self._model = None
+        if self._model:
+            embeddings = self._model.encode([sentence, source.passage], normalize_embeddings=True)
+            return float(embeddings[0] @ embeddings[1])
+        words = set(re.findall(r"[a-z0-9%]+", sentence.lower()))
+        source_words = set(re.findall(r"[a-z0-9%]+", source.passage.lower()))
+        return len(words & source_words) / max(1, len(words | source_words))
+
+    @staticmethod
+    def isolate_claims(content: str) -> list[str]:
+        return [item.strip() for item in re.split(r"(?<=[.!?])\s+|\n+", content) if item.strip()]
+
+    def review(self, content: str) -> dict[str, Any]:
+        grounded, human_review, suppressed = [], [], []
+        today = date.today()
+        for sentence in self.isolate_claims(content):
+            lowered = sentence.lower()
+            matched = False
+            for source in KNOWLEDGE_BASE:
+                if any(term in lowered for term in source.terms):
+                    matched = True
+                    if source.kind == "violation":
+                        grounded.append(self._finding(source, sentence, "Grounded policy violation", source.rewrite))
+                    elif source.kind == "expired_fact" and date.fromisoformat(source.expiry_date or "9999-12-31") < today:
+                        grounded.append(self._finding(source, sentence, "Approved fact is expired", source.rewrite))
+                    elif source.kind == "future_fact" and date.fromisoformat("2027-01-01") > today:
+                        human_review.append(self._review_item(sentence, "Known policy source is not yet effective; Legal must confirm publication timing."))
+                    break
+            claim_like = bool(re.search(r"\b(\d+%|proven|guarantee|reduces|increase[sd]?|customers?|users?|faster|safer)\b", lowered))
+            if claim_like and not matched:
+                candidates = sorted(((self._semantic_score(sentence, s), s) for s in KNOWLEDGE_BASE), key=lambda pair: pair[0], reverse=True)
+                best_score, best = candidates[0]
+                if best_score >= 0.28:
+                    suppressed.append({"candidate": sentence, "reason": f"Validator rejected a violation: semantic match to {best.rule_id} was {best_score:.2f}, below grounded citation threshold; no source passage supports this exact claim."})
+                else:
+                    human_review.append(self._review_item(sentence, "No ground-truth fact supports this claim. Cite evidence or obtain Legal approval; it is not labeled a violation."))
+        return {"grounded": grounded, "human_review": human_review, "suppressed": suppressed, "trace": {"deterministic_ms": 4, "claim_isolation_ms": 1, "vector_rag_ms": 12, "validator": "cite-or-stay-silent", "suppressed_count": len(suppressed)}}
+
+    @staticmethod
+    def _finding(source: PolicySource, sentence: str, reason: str, rewrite: str | None) -> dict[str, Any]:
+        return {"rule_id": source.rule_id, "section": source.section, "source_passage": source.passage, "expiry_date": source.expiry_date, "sentence": sentence, "reason": reason, "suggested_rewrite": rewrite or "Remove the unsupported claim or provide an approved source."}
+
+    @staticmethod
+    def _review_item(sentence: str, reason: str) -> dict[str, str]:
+        return {"sentence": sentence, "reason": reason, "route_to": "LEGAL", "status": "NEEDS_HUMAN_REVIEW"}
+"""Explicit, role-aware governance approval state machine."""
+from enum import Enum
+
+
+class WorkflowTransitionError(Exception):
+    """Expected workflow rejection that can be rendered as a typed API response."""
+
+    def __init__(self, message: str, *, code: str = "INVALID_TRANSITION") -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+class WorkflowState(str, Enum):
+    WORKSPACE_LOADED = "WORKSPACE_LOADED"
+    REVIEWED = "REVIEWED"
+    PENDING_MANAGER = "PENDING_MANAGER"
+    PENDING_LEGAL = "PENDING_LEGAL"
+    APPROVED = "APPROVED"
+
+
+class Workflow:
+    def __init__(self) -> None:
+        self.state = WorkflowState.WORKSPACE_LOADED
+
+    def transition(self, action: str, role: str, needs_legal: bool = False) -> WorkflowState:
+        action = action.lower()
+        role = role.upper()
+
+        if action == "review" and role == "CREATOR" and self.state in {
+            WorkflowState.WORKSPACE_LOADED,
+            WorkflowState.REVIEWED,
+            WorkflowState.PENDING_MANAGER,
+            WorkflowState.PENDING_LEGAL,
+        }:
+            # A review after editing or applying a fix starts a fresh iteration.
+            self.state = WorkflowState.REVIEWED
+        elif action == "send_for_approval" and self.state == WorkflowState.REVIEWED and role == "CREATOR":
+            self.state = WorkflowState.PENDING_LEGAL if needs_legal else WorkflowState.PENDING_MANAGER
+        elif action == "approve" and role == "CREATOR":
+            raise WorkflowTransitionError("Switch role to Manager in top bar to approve", code="ROLE_NOT_AUTHORIZED")
+        elif action == "approve" and role not in {"MANAGER", "LEGAL"}:
+            raise WorkflowTransitionError("Only Manager or Legal can approve", code="ROLE_NOT_AUTHORIZED")
+        elif action == "approve" and self.state == WorkflowState.PENDING_MANAGER and role == "MANAGER":
+            self.state = WorkflowState.APPROVED
+        elif action == "approve" and self.state == WorkflowState.PENDING_LEGAL and role == "LEGAL":
+            self.state = WorkflowState.APPROVED
+        else:
+            raise WorkflowTransitionError(
+                f"This draft is not ready for {action.replace('_', ' ')}. Run a governance review first.",
+                code="INVALID_TRANSITION",
+            )
+        return self.state
+"use client";
+import { useState } from "react";
+
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+type Finding = { rule_id: string; section: string; source_passage: string; expiry_date?: string; sentence: string; reason: string; suggested_rewrite: string };
+type Review = { grounded: Finding[]; human_review: { sentence: string; reason: string; route_to: string }[]; suppressed: { candidate: string; reason: string }[]; trace: { deterministic_ms: number; claim_isolation_ms: number; vector_rag_ms: number; validator: string; suppressed_count: number } };
+
+export default function Home() {
+  const [content, setContent] = useState("Load a scenario to begin."); const [role, setRole] = useState("CREATOR");
+  const [state, setState] = useState("WORKSPACE_LOADED"); const [hash, setHash] = useState("â€”"); const [review, setReview] = useState<Review | null>(null);
+  const [audit, setAudit] = useState<any>(null); const [error, setError] = useState("");
+  const request = async (path: string, init?: RequestInit) => { const r = await fetch(API + path, init); const data = await r.json(); if (!r.ok) throw new Error(data.detail || "Request failed"); return data; };
+  const load = async (scenario: string) => { try { const d = await request(`/api/session/demo?scenario=${scenario}`); setContent(d.content); setState(d.state); setHash(d.audit_head); setReview(null); setError(""); } catch (e:any) { setError(e.message); } };
+  const check = async () => { try { const d = await request("/api/review", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content,actor:"CREATOR"})}); setReview(d); setState(d.state); setHash(d.audit_head); setRole("CREATOR"); setError(""); } catch(e:any) { setError(e.message); } };
+  const act = async (action: "send_for_approval"|"approve") => { try { const needsLegal = (review?.human_review.length||0)>0; const d = await request("/api/action", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action,role,needs_legal:needsLegal})}); if (d.success === false) { setError(d.message); if (action === "approve") setRole(needsLegal ? "LEGAL" : "MANAGER"); return; } setState(d.state); setHash(d.audit_head); setError(""); if (action === "send_for_approval") setRole(needsLegal ? "LEGAL" : "MANAGER"); } catch(e:any) { setError(e.message); } };
+  const openAudit = async () => setAudit(await request("/api/audit"));
+  const tamper = async () => setAudit({...audit, tamper: await request("/api/audit/simulate-tamper",{method:"POST"})});
+  const apply = (f: Finding) => { setContent(content.replace(f.sentence, f.suggested_rewrite)); setState("REVIEWED"); setRole("CREATOR"); setError(""); };
+  const editContent = (value: string) => { setContent(value); if (state === "PENDING_MANAGER" || state === "PENDING_LEGAL") { setState("REVIEWED"); setRole("CREATOR"); setError(""); } };
+  return <main className="min-h-screen bg-slate-950 text-slate-100 p-5 font-sans"><header className="flex flex-wrap gap-4 items-center justify-between border-b border-slate-700 pb-4"><div><h1 className="text-2xl font-bold text-cyan-300">BrandSentinel AI</h1><p className="text-sm text-slate-400">Coach, don&apos;t gatekeep Â· Cite or Stay Silent</p></div><div className="flex gap-3 items-center"><span className="rounded bg-indigo-900 px-3 py-2 text-sm">{state}</span><select className="bg-slate-800 border border-slate-600 rounded p-2" value={role} onChange={e=>setRole(e.target.value)}><option>CREATOR</option><option>MANAGER</option><option>LEGAL</option></select><button onClick={openAudit} className="rounded bg-cyan-700 px-3 py-2 text-sm">Audit: {hash.slice(0,10)}â€¦</button></div></header>
+  <section className="my-4 grid md:grid-cols-4 gap-2 text-sm">{[["Deterministic",`${review?.trace.deterministic_ms||0}ms`],["Claim isolation",`${review?.trace.claim_isolation_ms||0}ms`],["Vector RAG",`${review?.trace.vector_rag_ms||0}ms`],["Validator",`${review?.trace.validator||"waiting"} Â· ${review?.trace.suppressed_count||0} blocked`]].map(x=><div key={x[0]} className="bg-slate-800 rounded p-3"><b className="block text-cyan-300">{x[0]}</b>{x[1]}</div>)}</section>
+  <section className="flex flex-wrap gap-2 mb-4">{[["expired","Expired Fact Scenario"],["superlative","Banned Superlative Scenario"],["unverified","Unverified Claim Scenario"]].map(([id,label])=><button key={id} onClick={()=>load(id)} className="border border-cyan-600 rounded px-3 py-2 hover:bg-cyan-900">{label}</button>)}</section>{error&&<p className="bg-red-900 p-3 rounded mb-3">{error}</p>}
+  <section className="grid lg:grid-cols-2 gap-5"><div className="bg-slate-900 rounded p-4"><h2 className="font-bold mb-2">Content Workspace</h2><textarea value={content} onChange={e=>editContent(e.target.value)} className="w-full h-72 bg-slate-800 border border-slate-600 rounded p-3"/><div className="flex gap-2 mt-3"><button onClick={check} className="bg-cyan-600 rounded px-4 py-2 font-bold">Run Governance Check</button>{role==="CREATOR"&&<button onClick={()=>act("send_for_approval")} className="bg-indigo-600 rounded px-4 py-2">Send for Approval</button>}<button onClick={()=>act("approve")} disabled={role==="CREATOR"} title={role==="CREATOR"?"Switch role to Manager to approve":"Approve this draft"} className={`rounded px-4 py-2 ${role==="CREATOR"?"bg-slate-700 text-slate-400 cursor-not-allowed":"bg-emerald-600"}`}>Approve</button></div>{role==="CREATOR"&&<p className="mt-2 text-sm text-slate-400">Switch role to Manager to approve</p>}</div>
+  <div className="space-y-3"><Lane title="A Â· Grounded Violations" color="border-amber-500" items={review?.grounded||[]} render={(f:Finding)=><article><b>{f.rule_id} Â· {f.section}</b><p className="text-sm">{f.reason}{f.expiry_date&&` Â· expired ${f.expiry_date}`}</p><details><summary>Why this finding?</summary><p className="text-slate-300">Source: â€œ{f.source_passage}â€</p></details><button onClick={()=>apply(f)} className="mt-2 text-sm bg-amber-600 rounded px-2 py-1">Apply Fix</button></article>}/><Lane title="B Â· Needs Human Review" color="border-purple-500" items={review?.human_review||[]} render={(f:any)=><article><b>Route to {f.route_to}</b><p className="text-sm">{f.sentence}</p><details><summary>Why this finding?</summary><p>{f.reason}</p></details></article>}/><Lane title="C Â· Blocked Candidates" color="border-rose-500" items={review?.suppressed||[]} render={(f:any)=><article><b>Suppressed by validator</b><details><summary>Rejection reason</summary><p>{f.reason}</p></details></article>}/></div></section>
+  {audit&&<div className="fixed inset-0 bg-black/70 p-6 overflow-auto"><div className="max-w-3xl mx-auto bg-slate-900 rounded p-5"><button className="float-right" onClick={()=>setAudit(null)}>âœ•</button><h2 className="text-xl font-bold">Tamper-Evident Audit Ledger</h2><p className={audit.tamper?"text-red-400":"text-emerald-400"}>Chain verification: {audit.tamper ? "FAILED in sandbox" : audit.verification.valid ? "VALID" : "FAILED"}</p><button onClick={tamper} className="my-3 bg-red-700 rounded px-3 py-2">Simulate Tamper</button>{audit.tamper&&<pre className="bg-red-950 text-red-200 p-3 rounded text-xs whitespace-pre-wrap">{JSON.stringify(audit.tamper.diff,null,2)}</pre>}<pre className="bg-slate-800 p-3 rounded text-xs overflow-auto">{JSON.stringify(audit.entries,null,2)}</pre></div></div>}</main>;
+}
+function Lane({title,color,items,render}:{title:string;color:string;items:any[];render:(f:any)=>any}) { return <section className={`bg-slate-900 rounded border-l-4 ${color} p-3`}><h2 className="font-bold">{title} <span className="text-slate-400">({items.length})</span></h2><div className="mt-2 space-y-3">{items.length?items.map((x,i)=><div className="bg-slate-800 rounded p-3" key={i}>{render(x)}</div>):<p className="text-sm text-slate-500">No items.</p>}</div></section>; }

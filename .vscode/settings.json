@@ -1,0 +1,8 @@
+﻿{
+  "python.defaultInterpreterPath": "C:/Users/LENVOVO/OneDrive/Desktop/New folder/backend/venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["C:/Users/LENVOVO/OneDrive/Desktop/New folder/backend"],
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none"
+  }
+}
