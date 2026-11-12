@@ -1,9 +1,12 @@
 ﻿from __future__ import annotations
+import hashlib
 import logging, os, re, threading
 from dataclasses import dataclass
 from datetime import date
 from time import perf_counter
 from typing import Any
+
+from app.core.policy_store import PolicySnapshot, PolicyStore
 
 log = logging.getLogger("brandsentinel.rag")
 MODEL_NAME = "all-MiniLM-L6-v2"
@@ -28,16 +31,12 @@ KNOWLEDGE_BASE: tuple[PolicySource, ...] = (
     PolicySource("VG-03", "Voice Guide S2.3", "Use direct, clear language and state product benefits without unverifiable comparisons.", None, "guidance", ("clear", "direct")),
 )
 
-_TERM_PATTERNS: dict[str, list[re.Pattern[str]]] = {
-    s.rule_id: [re.compile(rf"(?<!\w){re.escape(t)}(?!\w)", re.IGNORECASE) for t in s.terms]
-    for s in KNOWLEDGE_BASE
-}
-
 CLAIM_RE = re.compile(r"\d+(?:[.,]\d+)?\s?%|\b(?:proven|guarantee[sd]?|reduc(?:e|es|ed)|increase[sd]?|faster|safer|customers?|users?|zero fees)\b", re.IGNORECASE)
 _WORDS_RE = re.compile(r"[a-z0-9%]+")
 
-def _first_hit(source: PolicySource, sentence: str) -> str | None:
-    for pattern in _TERM_PATTERNS[source.rule_id]:
+
+def _first_hit(snapshot: PolicySnapshot, source: PolicySource, sentence: str) -> str | None:
+    for pattern in snapshot.patterns[source.rule_id]:
         match = pattern.search(sentence)
         if match:
             return match.group(0)
@@ -60,10 +59,10 @@ class RagEngine:
     def __init__(self, enable_embeddings: bool = True) -> None:
         self._enabled = enable_embeddings and os.environ.get("DISABLE_EMBEDDINGS", "0") != "1"
         self._model: Any | None = None
-        self._vectors: Any | None = None
         self._warmed = False
         self._warm_lock = threading.Lock()
         self.retrieval_mode = "lexical_fallback"
+        self._policy_store = PolicyStore(self._embed_passages)
 
     def warm(self) -> str:
         with self._warm_lock:
@@ -74,15 +73,64 @@ class RagEngine:
                     from sentence_transformers import SentenceTransformer
                     local_only = os.environ.get("EMBEDDING_LOCAL_ONLY", "0") == "1"
                     model = SentenceTransformer(MODEL_NAME, local_files_only=local_only)
-                    vectors = model.encode([s.passage for s in KNOWLEDGE_BASE], normalize_embeddings=True)
                     model.encode(["warm-up query"], normalize_embeddings=True)
-                    self._model, self._vectors = model, vectors
+                    self._model = model
                     self.retrieval_mode = "embedding"
                 except Exception:
-                    self._model = self._vectors = None
+                    log.warning("Embedding model unavailable; using lexical policy retrieval.", exc_info=True)
+                    self._model = None
                     self.retrieval_mode = "lexical_fallback"
+            if not self._policy_store_ready():
+                try:
+                    snapshot = self._policy_store.stage(
+                        list(KNOWLEDGE_BASE),
+                        hashlib.sha256(b"brandsentinel-default-policy-v1").hexdigest(),
+                        "builtin-1",
+                    )
+                except Exception:
+                    log.exception("Could not embed built-in policies; using lexical retrieval.")
+                    self._model = None
+                    self.retrieval_mode = "lexical_fallback"
+                    snapshot = self._policy_store.stage(
+                        list(KNOWLEDGE_BASE),
+                        "builtin",
+                        "builtin-1",
+                    )
+                self._policy_store.activate(snapshot.version, "SYSTEM")
             self._warmed = True
             return self.retrieval_mode
+
+    def _policy_store_ready(self) -> bool:
+        try:
+            self._policy_store.active()
+            return True
+        except RuntimeError:
+            return False
+
+    def _embed_passages(self, passages: list[str]) -> Any | None:
+        if self._model is None:
+            return None
+        return self._model.encode(passages, normalize_embeddings=True)
+
+    def stage_policy(self, rules: list[PolicySource], raw_sha: str, version_tag: str) -> PolicySnapshot:
+        self.warm()
+        return self._policy_store.stage(rules, raw_sha, version_tag)
+
+    def activate_policy(self, version: str, actor: str) -> PolicySnapshot:
+        self.warm()
+        return self._policy_store.activate(version, actor)
+
+    def active_policy(self) -> PolicySnapshot:
+        self.warm()
+        return self._policy_store.active()
+
+    def staged_policies(self) -> list[PolicySnapshot]:
+        self.warm()
+        return self._policy_store.staged()
+
+    def policy_history(self) -> list[str]:
+        self.warm()
+        return self._policy_store.history()
 
     @staticmethod
     def _lexical_score(sentence: str, source: PolicySource) -> float:
@@ -90,13 +138,13 @@ class RagEngine:
         source_words = set(_WORDS_RE.findall(source.passage.lower()))
         return len(words & source_words) / max(1, len(words | source_words))
 
-    def _nearest(self, sentence: str) -> tuple[float, PolicySource]:
-        if self._model is not None and self._vectors is not None:
+    def _nearest(self, sentence: str, snapshot: PolicySnapshot) -> tuple[float, PolicySource]:
+        if self._model is not None and snapshot.vectors is not None:
             query = self._model.encode([sentence], normalize_embeddings=True)[0]
-            scores = self._vectors @ query
+            scores = snapshot.vectors @ query
             best = int(scores.argmax())
-            return float(scores[best]), KNOWLEDGE_BASE[best]
-        return max(((self._lexical_score(sentence, s), s) for s in KNOWLEDGE_BASE), key=lambda pair: pair[0])
+            return float(scores[best]), snapshot.rules[best]
+        return max(((self._lexical_score(sentence, s), s) for s in snapshot.rules), key=lambda pair: pair[0])
 
     @staticmethod
     def isolate_claims(content: str) -> list[str]:
@@ -105,6 +153,7 @@ class RagEngine:
     def review(self, content: str, today: date | None = None) -> dict[str, Any]:
         if not self._warmed:
             self.warm()
+        snapshot = self._policy_store.active()
         today = today or date.today()
         grounded: list[dict[str, Any]] = []
         human_review: list[dict[str, Any]] = []
@@ -120,8 +169,8 @@ class RagEngine:
         for sentence in sentences:
             t0 = perf_counter()
             supported = False
-            for source in KNOWLEDGE_BASE:
-                term = _first_hit(source, sentence)
+            for source in snapshot.rules:
+                term = _first_hit(snapshot, source, sentence)
                 if term is None or source.kind == "guidance":
                     continue
                 supported = True
@@ -134,7 +183,7 @@ class RagEngine:
 
             if not supported and CLAIM_RE.search(sentence):
                 t1 = perf_counter()
-                score, nearest = self._nearest(sentence)
+                score, nearest = self._nearest(sentence, snapshot)
                 retrieval_s += perf_counter() - t1
                 if score >= threshold:
                     reason = f"Retrieval proposed rule {nearest.rule_id} but lacks approved term support. Routed to Legal."
@@ -161,6 +210,8 @@ class RagEngine:
                 "vector_rag_ms": round(retrieval_s * 1000, 2),
                 "total_ms": round(total_s * 1000, 2),
                 "retrieval_mode": self.retrieval_mode,
+                "policy_version": snapshot.version,
+                "policy_sha256": snapshot.sha256,
                 "validator": "cite-or-stay-silent",
                 "claims_checked": len(sentences),
                 "suppressed_count": len(suppressed),
