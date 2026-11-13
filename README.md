@@ -12,7 +12,7 @@
 
 **CodeNexus India 2026 | Grand Finale (Round 3) | Problem statement by Inkloom AI**
 
-**Live demo:** _add the deployed URL here_ | **Final technical report:** _add the PDF link here_
+**Live demo:** _add the deployed URL here_ | **Final technical report:[** _add the PDF link here_](https://drive.google.com/file/d/1iol73537dw1Jn1QRRwsKgPOHbR5RjITI/view?usp=sharing)
 
 </div>
 
